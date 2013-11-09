@@ -1,0 +1,686 @@
+heat_template_version: 2013-05-23
+
+description: Auto-Scaling OpenShift Environment
+
+parameters:
+  key_name:
+    description: Name of an existing keypair to enable SSH access to the instances
+    type: String
+    AllowedPattern: '[-_ a-zA-Z0-9]*'
+  prefix:
+    description: Your DNS Prefix
+    type: String
+    default: example.com
+  openshift_user:
+    description: Default User Name
+    type: String
+    default: openshift
+  openshift_password:
+    description: Default User Password
+    type: String
+    default: openshift
+  UpstreamDNS:
+    description: Upstream DNS server
+    type: String
+    default: 8.8.8.8
+  broker_flavor:
+    description: Flavor of broker server
+    type: String
+    default: m1.small
+    allowed_values: [m1.small, m1.medium, m1.large, m1.xlarge]
+    Constraintdescription: Must be a valid server flavor
+  node_flavor:
+    description: Flavor of node servers
+    type: String
+    default: m1.small
+    allowed_values: [m1.small, m1.medium, m1.large, m1.xlarge]
+    Constraintdescription: Must be a valid server flavor
+
+resources:
+  openshift_origin_security_group:
+    type: AWS::EC2::SecurityGroup
+    properties:
+      GroupDescription: Standard firewall rules
+      SecurityGroupIngress:
+      - {IpProtocol: udp, FromPort: '53', ToPort: '53', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '53', ToPort: '53', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '22', ToPort: '22', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '80', ToPort: '80', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '443', ToPort: '443', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '8000', ToPort: '8000', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '8443', ToPort: '8443', CidrIp: 0.0.0.0/0}
+  BrokerWaitHandle:
+    type: AWS::CloudFormation::WaitConditionHandle
+  BrokerWaitCondition:
+    type: AWS::CloudFormation::WaitCondition
+    DependsOn: openshift_broker_instance
+    Properties:
+      Handle:
+        Ref: BrokerWaitHandle
+      Timeout: '6000'
+  openshift_broker_instance:
+    type: OS::Nova::Server
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              ntp: []
+              git: []
+              which: []
+              policycoreutils: []
+              firewalld: []
+              bind: []
+              bind-utils: []
+              openshift-origin-broker-util: []
+              mongodb-server: []
+              mcollective-qpid-pugin-cpp: []
+              qpid-cpp-server: []
+              mcollective-client: []
+              openshift-origin-broker: [] 
+              openshift-origin-broker-util: [] 
+              rubygem-openshift-origin-auth-remote-user: [] 
+              rubygem-openshift-origin-msg-broker-mcollective: [] 
+              rubygem-openshift-origin-dns-bind: []
+              rubygem-psych: []
+              rubygem-mocha: []
+              rubygem-mongoid: []
+              facter: []
+    properties:
+      image: 'F19-x86_64-cfntools'
+      flavor: { get_param: broker_flavor }
+      key_name: { get_param: key_name }
+      security_groups: [{ get_resource: openshift_origin_security_group }]
+      user_data:
+       str_replace:
+          template: |
+                #!/bin/bash -x
+                cfn-init
+                systemctl enable firewalld.service
+                systemctl start firewalld.service
+
+                # OS common-date-time.sh
+                ntpdate clock.redhat.com
+                systemctl enable ntpd.service
+                systemctl start ntpd.service
+
+                # OS broker-dns.sh
+                # setup DNSSEC key pair
+                cd /var/named/
+                rm -f KDOMAIN*
+                dnssec-keygen -a HMAC-MD5 -b 512 -n USER -r /dev/urandom DOMAIN
+                export DNS_SEC_KEY="`cat /var/named/K${PREFIX}.*.key | awk 'print $8'`"
+                KEY="$(grep Key: KDOMAIN*.private | cut -d ' ' -f 2)"
+                cd -
+                echo $DNS_SEC_KEY
+                rndc-confgen -a -r /dev/urandom
+
+                # setup permissions for the DNSSEC key pair
+                restorecon -v /etc/rndc.* /etc/named.*
+                chown -v root:named /etc/rndc.key
+                chmod -v 640 /etc/rndc.key
+
+                # setup forwarders
+                echo "forwarders { 8.8.8.8; 8.8.4.4; } ;" >> /var/named/forwarders.conf
+                restorecon -v /var/named/forwarders.conf
+                chmod -v 640 /var/named/forwarders.conf
+
+                # setup initial DNS database
+                rm -rvf /var/named/dynamic
+                mkdir -vp /var/named/dynamic
+
+                cat <<EOF > /var/named/dynamic/DOMAIN.db
+                \$ORIGIN .
+                \$TTL 1	; 1 seconds (for testing only)
+                DOMAIN IN SOA ns1.DOMAIN. hostmaster.DOMAIN. (
+                                         2011112904 ; serial
+                                         60         ; refresh (1 minute)
+                                         15         ; retry (15 seconds)
+                                         1800       ; expire (30 minutes)
+                                         10         ; minimum (10 seconds)
+                                          )
+                                     NS ns1.DOMAIN.
+                                     MX 10 mail.DOMAIN.
+                \$ORIGIN DOMAIN.
+                ns1	              A        127.0.0.1
+
+                EOF
+
+                # Install the DNSSEC key
+                cat <<EOF > /root/dnssec_keyfile
+                key DOMAIN {
+                  algorithm HMAC-MD5;
+                  secret "$DNS_SEC_KEY";
+                };
+                EOF
+
+                # Set permissions for key and database
+                chown -Rv named:named /var/named
+                restorecon -rv /var/named
+
+                # Check the key and database
+                echo "/var/named/dynamic/DOMAIN.db"
+                cat /var/named/dynamic/DOMAIN.db
+                echo ""
+                echo "/root/dnssec_keyfile"
+                cat /root/dnssec_keyfile
+
+                # Create the named configuration file
+                mv /etc/named.conf /etc/named.conf.openshift
+                cat <<EOF > /etc/named.conf
+                // named.conf
+                //
+                // Provided by Red Hat bind package to configure the ISC BIND named(8) DNS
+                // server as a caching only nameserver (as a localhost DNS resolver only).
+                //
+                // See /usr/share/doc/bind*/sample/ for example named configuration files.
+                //
+
+                options {
+                    listen-on port 53 { any; };
+                    directory "/var/named";
+                    dump-file "/var/named/data/cache_dump.db";
+                    statistics-file "/var/named/data/named_stats.txt";
+                    memstatistics-file "/var/named/data/named_mem_stats.txt";
+                    allow-query { any; };
+                    recursion yes;
+
+                    /* Path to ISC DLV key */
+                    bindkeys-file "/etc/named.iscdlv.key";
+
+                    // set forwarding to the next nearest server (from DHCP response
+                    forward only;
+                    include "forwarders.conf";
+                };
+
+                logging {
+                    channel default_debug {
+                        file "data/named.run";
+                        severity dynamic;
+                    };
+                };
+
+                // use the default rndc key
+                include "/etc/rndc.key";
+ 
+                controls {
+                    inet 127.0.0.1 port 953
+                    allow { 127.0.0.1; } keys { "rndc-key"; };
+                };
+
+                include "/etc/named.rfc1912.zones";
+
+                include "DOMAIN.key";
+
+                zone "DOMAIN" IN {
+                    type master;
+                    file "dynamic/DOMAIN.db";
+                    allow-update { key DOMAIN ; } ;
+                };
+                EOF
+
+                # setup permissions of named config file
+                chown -v root:named /etc/named.conf
+                restorecon /etc/named.conf
+
+                # Check the named file
+                echo ""
+                echo "/etc/named.conf"
+                cat /etc/named.conf
+
+                # Setup firewall
+                firewall-cmd --add-service=dns
+                firewall-cmd --permanent --add-service=dns
+                # Setup and start service
+                systemctl enable named.service
+                systemctl start named.service
+
+                export BROKERIP=`facter ipaddress`
+                export BROKERHOSTNAME="`facter ec2_instance_id`"
+
+                ## add entries using nsupdate
+                #echo "You need to cut and paste the following at the prompt"
+                #echo "=====start cut below this line===="
+                #echo "server 127.0.0.1 "
+                #echo "update delete $BROKERHOSTNAME A "
+                #echo "update add $BROKERHOSTNAME 180 A $BROKERIP"
+                #echo "send "
+                #echo "quit "
+                #echo "=====end cut above this line===="
+                #nsupdate -k /root/dnssec_keyfile
+                oo-register-dns -s 127.0.0.1 -h $BROKERHOSTNAME -d DOMAIN -n $BROKERIP -k /root/dnssec_keyfile
+
+                ## OSOO broker-dhcp.sh
+                # setup dhcp client
+                echo "prepend domain-name-servers $BROKERIP;" >> /etc/dhcp/dhclient-eth0.conf
+                echo "supersede host-name \"$BROKERHOSTNAME\";" >> /etc/dhcp/dhclient-eth0.conf
+                echo "supersede domain-name \"DOMAIN\";" >> /etc/dhcp/dhclient-eth0.conf
+
+                NSFILE="/etc/sysconfig/network-scripts/ifcfg-eth0"
+                if [ -f $NSFILE ] ; then
+                	if grep -q PEERDNS $NSFILE ; then
+                		sed -i 's/PEERDNS=.*/PEERDNS=\"no\"/' $NSFILE
+                	else
+                		echo PEERDNS=\"no\" >> $NSFILE
+                	fi
+                	if grep -q DNS1 $NSFILE ; then
+                		sed -i "s/DNS1=.*/DNS1=$BROKERIP" $NSFILE
+                	else
+                		echo DNS1=$BROKERIP >> $NSFILE
+                	fi
+                fi
+
+                ## OSOO broker-hostname.sh
+                echo "$BROKERHOSTNAME" > /etc/hostname
+
+                hostname $BROKERHOSTNAME
+
+                ## OSOO broker-mongodb.sh
+
+                #echo "Tweak mongodb config file"
+                #echo "  Uncomment auth = true"
+                #echo "  Add smallfiles = true"
+                #echo "  Hit return to start"
+                #read tempkey
+                #vi /etc/mongodb.conf
+                sed -i -e 's|#auth = true|auth = true\nsmallfiles = true|g' /etc/mongodb.conf
+
+                systemctl enable mongod.service
+                systemctl start  mongod.service
+
+                ## OSOO broker-messaging.sh
+                # Setup firewall
+                firewall-cmd --add-port=5672/tcp
+                firewall-cmd --permanent --add-port=5672/tcp
+                firewall-cmd --list-all
+
+                # Setup and start service
+                /usr/bin/systemctl enable qpidd.service
+                /usr/bin/systemctl start qpidd.service
+
+                ## OSOO broker-mcollective-client.sh
+                # Move old config out of the way
+                mv /etc/mcollective/client.cfg /etc/mcollective/client.cfg.orig
+
+                # Create new client config file
+                cat <<EOF > /etc/mcollective/client.cfg
+                topicprefix = /topic/
+                main_collective = mcollective
+                collectives = mcollective
+                libdir = /usr/libexec/mcollective
+                loglevel = debug
+                logfile = /var/log/mcollective-client.log
+
+                # Plugins
+                securityprovider = psk
+                plugin.psk = unset
+                connector = qpid
+                plugin.qpid.host=$BROKERHOSTNAME
+                plugin.qpid.secure=false
+                plugin.qpid.timeout=5
+
+                # Facts
+                factsource = yaml
+                plugin.yaml = /etc/mcollective/facts.yaml
+                EOF
+
+                ## OSOO broker-broker-app.sh
+
+                # Modifying the broker proxy server name
+                sed -i -e "s/ServerName .*$/ServerName $BROKERHOSTNAME/" /etc/httpd/conf.d/000002_openshift_origin_broker_servername.conf 
+
+                # Setup and start service
+                /usr/bin/systemctl enable httpd.service
+                /usr/bin/systemctl enable ntpd.service
+                /usr/bin/systemctl enable sshd.service
+
+                # Setup Firewall
+                firewall-cmd --add-service=ssh
+                firewall-cmd --add-service=http
+                firewall-cmd --add-service=https
+                firewall-cmd --permanent --add-service=ssh
+                firewall-cmd --permanent --add-service=http
+                firewall-cmd --permanent --add-service=https
+                firewall-cmd --list-all
+
+                # Generate access key
+                openssl genrsa -out /etc/openshift/server_priv.pem 2048
+                openssl rsa -in /etc/openshift/server_priv.pem -pubout > /etc/openshift/server_pub.pem
+                ssh-keygen -t rsa -b 2048 -f ~/.ssh/rsync_id_rsa -N ""
+                cp -v ~/.ssh/rsync_id_rsa* /etc/openshift/
+
+                # Setup selinux boolean variables and set file contexts
+                setsebool -P httpd_unified=on httpd_can_network_connect=on httpd_can_network_relay=on httpd_run_stickshift=on named_write_master_zones=on
+                fixfiles -R rubygem-passenger restore
+                fixfiles -R mod_passenger restore
+                restorecon -rv /var/run
+                restorecon -rv /usr/share/gems/gems/passenger-*
+
+                # Tweak broker config, if needed
+                #echo ""
+                #echo "Tweak broker config file"
+                #echo "  Might not have to do anything but make sure you have the following lines"
+                #echo "    CLOUD_DOMAIN=\"DOMAIN\""
+                #echo "    VALID_GEAR_SIZES=\"small,medium\""
+                #read tempkey
+                #vi /etc/openshift/broker.conf
+                if grep -q "VALID_GEAR_SIZES=\"small,medium\"" /etc/openshift/broker.conf ; then
+                  echo "  VALID_GEAR_SIZES are correct"
+                else 
+                  echo "  Fixing up VALID_GEAR_SIZES"
+                  sed -i -e 's|VALID_GEAR_SIZES=.*$|VALID_GEAR_SIZES=\"small,medium\"|g' /etc/openshift/broker.conf
+                fi
+
+                if grep -q "CLOUD_DOMAIN=\"DOMAIN\"" /etc/openshift/broker.conf ; then
+                  echo "  CLOUD_DOMAIN is correct"
+                else 
+                  echo "  Fixing up CLOUD_DOMAIN"
+                  sed -i -e "s|CLOUD_DOMAIN=.*$|CLOUD_DOMAIN=\"DOMAIN\"|g" /etc/openshift/broker.conf
+                fi
+
+                ## OSOO broker-plugins-accounts.h
+
+                # Create config files from examples
+                cp /usr/share/gems/gems/openshift-origin-auth-remote-user-*/conf/openshift-origin- auth-remote-user.conf.example /etc/openshift/plugins.d/openshift-origin-auth-remote-user.conf
+                cp /etc/openshift/plugins.d/openshift-origin-msg-broker-mcollective.conf.example /etc/openshift/plugins.d/openshift-origin-msg-broker-mcollective.conf
+
+                # Config the DNS profile
+                cd /var/named/
+                KEY="$(grep Key: KDOMAIN*.private | cut -d ' ' -f 2)"
+
+                cat <<EOF > /etc/openshift/plugins.d/openshift-origin-dns-bind.conf
+                BIND_SERVER="127.0.0.1"
+                BIND_PORT=53
+                BIND_KEYNAME="DOMAIN"
+                BIND_KEYVALUE="$DNS_SEC_KEY"
+                BIND_ZONE="DOMAIN"
+                EOF
+
+                # Configure authentication plugin and add a user
+                cp -v /var/www/openshift/broker/httpd/conf.d/openshift-origin-auth-remote-user-basic.conf.sample /var/www/openshift/broker/httpd/conf.d/openshift-origin-auth-remote-user.conf
+                htpasswd -c -b -s /etc/openshift/htpasswd OPENSHIFT_USER OPENSHIFT_PASSWORD
+
+                # Add Mongodb account
+                grep MONGO /etc/openshift/broker.conf
+                mongo openshift_broker_dev --eval 'db.addUser("$MONGODB_BROKER_USER", "$MONGODB_BROKER_PASSWORD")'
+
+                bundle --local
+
+                # Setup and start service
+                /usr/bin/systemctl enable httpd.service
+                /usr/bin/systemctl enable openshift-broker.service
+                /usr/bin/systemctl start httpd.service
+                /usr/bin/systemctl start openshift-broker.service
+                /usr/bin/systemctl status openshift-broker.service
+
+                # All is well so signal success
+                /opt/aws/bin/cfn-signal -e 0 --data "$DNS_SEC_KEY" -r "Broker setup complete" "BROKER_WAIT_HANDLE"
+                setenforce 1
+          params:
+            DOMAIN: { get_param: prefix }
+            BROKER_WAIT_HANDLE: { get_resource: BrokerWaitHandle }
+            OPENSHIFT_USER: { get_param: openshift_user }
+            OPENSHIFT_PASSWORD: { get_param: openshift_password }
+
+  openshift_node_instance:
+    type: OS::Nova::Server
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+           yum:
+             ntp: []
+             git: []
+             which: []
+             policycoreutils: []
+             firewalld: []
+             openshift-origin-msg-node-mcollective: []
+             mcollective-qpid-plugin: []
+             rubygem-openshift-origin-node: []
+             rubygem-passenger-native: []
+             openshift-origin-port-proxy: []
+             openshift-origin-node-util: []
+             openshift-origin-cartridge-cron-1.4: []
+             openshift-origin-cartridge-diy-0.1: []
+             facter: []
+    properties:
+      image: 'F19-x86_64-cfntools'
+      flavor: { get_param: node_flavor }
+      key_name: { get_param: key_name }
+      security_groups: [{ get_resource: openshift_origin_security_group }]
+      user_data:
+       str_replace:
+          template: |
+                #!/bin/bash
+                cfn-init
+                systemctl enable firewalld.service
+                systemctl start firewalld.service
+
+                # OSOO common-date-time.sh
+
+                systemctl enable ntpd.service
+                systemctl start ntpd.service
+                export NODEIP=`facter ipaddress`
+                export NODEHOSTNAME="`facter ec2_instance_id`"
+
+
+                # OSOO node-dhcp.sh
+                # setup dhcp client
+                echo "prepend domain-name-servers BROKERIP;" >> /etc/dhcp/dhclient-eth0.conf
+                echo "supersede host-name \"${NODENAME}\";" >> /etc/dhcp/dhclient-eth0.conf
+                echo "supersede domain-name \"DOMAIN\";" >> /etc/dhcp/dhclient-eth0.conf
+
+                NSFILE="/etc/sysconfig/network-scripts/ifcfg-eth0"
+                if [ -f $NSFILE ] ; then
+                	if grep -q PEERDNS $NSFILE ; then
+                		sed -i 's/PEERDNS=.*/PEERDNS=\"no\"/' $NSFILE
+                	else
+                		echo PEERDNS=\"no\" >> $NSFILE
+                    	fi
+                	if grep -q DNS1 $NSFILE ; then
+                		sed -i "s/DNS1=.*/DNS1=BROKERIP" $NSFILE
+                	else
+                		echo DNS1=BROKERIP >> $NSFILE
+                	fi
+                fi
+
+                # OSOO node-hostname.sh
+                echo "${NODEHOSTNAME}" > /etc/hostname
+
+                hostname ${NODEHOSTNAME}
+                # OSOO node-mcollective.sh
+                mv /etc/mcollective/server.cfg /etc/mcollective/server.cfg.orig
+
+                #Create new configuration
+                cat <<EOF > /etc/mcollective/server.cfg
+                topicprefix = /topic/
+                main_collective = mcollective
+                collectives = mcollective
+                libdir = /usr/libexec/mcollective
+                logfile = /var/log/mcollective.log
+                loglevel = debug
+                daemonize = 1
+                direct_addressing = n
+
+                # Plugins
+                securityprovider = psk
+                plugin.psk = unset
+                connector = qpid
+                plugin.qpid.host=${BROKERHOSTNAME}
+                plugin.qpid.secure=false
+                plugin.qpid.timeout=5
+
+                # Facts
+                factsource = yaml
+                plugin.yaml = /etc/mcollective/facts.yaml
+                EOF
+
+                # Setup and start services
+                /bin/systemctl enable mcollective.service
+                /bin/systemctl start  mcollective.service
+
+                # OSOO node-app-install.sh
+                # Setup firewall
+                firewall-cmd --add-service=ssh
+                firewall-cmd --add-service=http
+                firewall-cmd --add-service=https
+                firewall-cmd --permanent --add-service=ssh
+                firewall-cmd --permanent --add-service=http
+                firewall-cmd --permanent --add-service=https
+                firewall-cmd --list-all
+
+                # OSOO node-pam.sh
+                sed -i -e 's|pam_selinux|pam_openshift|g' /etc/pam.d/sshd
+
+                for f in "runuser" "runuser-l" "sshd" "su" "system-auth-ac"
+                do
+                  t="/etc/pam.d/$f"
+                  if ! grep -q "pam_namespace.so" "$t"
+                  then
+                    echo -e "session\t\trequired\tpam_namespace.so no_unmount_on_close" >> "$t"
+                  fi
+                done
+
+                # OSOO node-cgroups.sh
+                # Cgroups Config - Need to still fixup the cgroup configurations
+                # Cgroups enable and startup services
+
+                /bin/systemctl enable cgconfig.service
+                /bin/systemctl enable cgred.service
+                /usr/sbin/chkconfig openshift-cgroups on
+                /bin/systemctl restart  cgconfig.service
+                /bin/systemctl restart  cgred.service
+                /usr/sbin/service openshift-cgroups restart
+
+                # OSOO node-quota.sh
+                # DISK QUOTA
+                #echo ""
+                #echo "Add usrquota to filesystem"
+                #echo "  add usrquota to whichever filesystem has /var/lib/openshift on it"
+                #echo "    Example:"
+                #echo "      /dev/sda1 / ext4    defaults,usrquota 1 1"
+                #echo ""
+                #echo "  Hit enter to begin editing fstab with vi"
+                #read tempkey
+                #vi /etc/fstab
+                /bin/cp -f /etc/fstab /etc/fstab.save.openshift
+                FS=`df /var/lib | grep -v Filesystem | awk '{print $6}'`
+                sed -i "s|^\S*\s\+${FS}\s\+\S*\s\+|&usrquota,|" /etc/fstab
+
+                # reboot or remount
+                mount -o remount /
+
+                # test
+                quotacheck -cmug /
+
+                # OSOO node-selinux.sh
+                #Setup SELINUX Booleans
+                setsebool -P httpd_unified=on httpd_can_network_connect=on httpd_can_network_relay=on httpd_read_user_content=on httpd_enable_homedirs=on httpd_run_stickshift=on allow_polyinstantiation=on
+
+                # Update selinux file settings
+                restorecon -rv /var/run
+                restorecon -rv /usr/sbin/mcollectived /var/log/mcollective.log /var/run/mcollectived.pid
+                restorecon -rv /var/lib/openshift /etc/openshift/node.conf /etc/httpd/conf.d/openshift
+
+                # OSOO node-system.sh
+                #SYSTEM CONTROL SETTINGS
+                echo "# Added for OpenShift" >> /etc/sysctl.d/openshift.conf
+                echo "kernel.sem = 250  32000 32  4096" >> /etc/sysctl.d/openshift.conf
+                echo "net.ipv4.ip_local_port_range = 15000 35530" >> /etc/sysctl.d/openshift.conf
+                echo "net.netfilter.nf_conntrack_max = 1048576" >> /etc/sysctl.d/openshift.conf
+                sysctl -p /etc/sysctl.d/openshift.conf
+
+
+                # OSOO node-ssh.sh
+                # SSH
+                #echo ""
+                #echo "Tweak sshd config file"
+                #echo "  Add the following at the end of the AcceptEnv section"
+                #echo "    AcceptEnv GIT_SSH"
+                #read tempkey
+                #vi /etc/ssh/sshd_config
+
+                if grep -q "GIT_SSH" /etc/ssh/sshd_config ; then
+                    echo "  sshd_config is already correct"
+                else
+                    echo "  Fixing up sshd_config"
+                    sed -i -e 's|AcceptEnv XMODIFIERS|AcceptEnv XMODIFIERS GIT_SSH|g' /etc/ssh/sshd_config
+                fi
+
+                perl -p -i -e "s/^#MaxSessions .*$/MaxSessions 40/" /etc/ssh/sshd_config
+                perl -p -i -e "s/^#MaxStartups .*$/MaxStartups 40/" /etc/ssh/sshd_config
+
+                /bin/systemctl restart  sshd.service
+
+
+                # OSOO node-proxy.sh
+                #PORT PROXY
+
+                firewall-cmd --add-port=35531-65535/tcp
+                firewall-cmd --permanent --add-port=35531-65535/tcp
+                firewall-cmd --list-all
+
+                /bin/systemctl enable openshift-port-proxy.service
+                /bin/systemctl restart  openshift-port-proxy.service
+
+
+                # OSOO node-app-config.sh
+
+                # Node application setup
+                /bin/systemctl enable httpd.service
+                /bin/systemctl enable openshift-gears.service
+
+                #echo ""
+                #echo "Tweak node config file"
+                #echo "  Make sure the settings are set to these values"
+                #echo "    PUBLIC_HOSTNAME=\"${NODEHOSTNAME}\""
+                #echo "    PUBLIC_IP=\"${NODEIP}\""
+                #echo "    BROKER_HOST=\"BROKERIP\""
+                #echo "    CLOUD_DOMAIN=\"DOMAIN\""
+                #read tempkey
+                #vi /etc/openshift/node.conf
+
+                if grep -q "PUBLIC_HOSTNAME=\"${NODEHOSTNAME}\"" /etc/openshift/node.conf ; then
+                  echo "  PUBLIC_HOSTNAME is correct"
+                else 
+                  echo "  Fixing up PUBLIC_HOSTNAME"
+                  sed -i -e "s|PUBLIC_HOSTNAME=.*$|PUBLIC_HOSTNAME=\"${NODEHOSTNAME}\"|g" /etc/openshift/node.conf
+                fi
+                if grep -q "PUBLIC_IP=\"${NODEIP}\"" /etc/openshift/node.conf ; then
+                  echo "  PUBLIC_IP is correct"
+                else 
+                  echo "  Fixing up PUBLIC_IP"
+                  sed -i -e "s|PUBLIC_IP=.*$|PUBLIC_IP=\"${NODEIP}\"|g" /etc/openshift/node.conf
+                fi
+                if grep -q "BROKER_HOST=\"BROKERIP\"" /etc/openshift/node.conf ; then
+                  echo "  BROKER_HOST is correct"
+                else 
+                  echo "  Fixing up BROKER_HOST"
+                  sed -i -e "s|BROKER_HOST=.*$|BROKER_HOST=\"BROKERIP\"|g" /etc/openshift/node.conf
+                fi
+                if grep -q "CLOUD_DOMAIN=\"DOMAIN\"" /etc/openshift/node.conf ; then
+                  echo "  CLOUD_DOMAIN is correct"
+                else 
+                  echo "  Fixing up CLOUD_DOMAIN"
+                  sed -i -e "s|CLOUD_DOMAIN=.*$|CLOUD_DOMAIN=\"DOMAIN\"|g" /etc/openshift/node.conf
+                fi
+
+                /etc/cron.minutely/openshift-facts
+                setenforce 0
+          params:
+            DOMAIN: { get_param: prefix }
+            BROKERIP: { get_attr: [ openshift_broker_instance, first_address ] }
+
+outputs:
+  OpenShiftConsole:
+    Value:
+      Fn::Join:
+      - ''
+      - ['https://', 'Fn::GetAtt': [openshift_broker_instance, PublicIp], '/console']
+    description: URL for OpenShift Origins console
+  NameServerEntry:
+    Value:
+      Fn::Join:
+      - ''
+      - ['nameserver ', 'Fn::GetAtt': [openshift_broker_instance, PublicIp]]
+    description: Entry to insert into /etc/resolv.conf for application host names to resolve
