@@ -7,8 +7,6 @@ import subprocess
 import uuid
 import yaml
 
-def parse(template):
-    return yaml.safe_load(template)
 
 class CommandRunner(object):
     """Helper class to run a command and store the output."""
@@ -59,7 +57,7 @@ class CommandRunner(object):
         return self._status
 
 template_file = open('OpenShift.yaml', 'r')
-template_yaml = parse(template_file)
+template_yaml = yaml.safe_load(template_file)
 m = hashlib.md5()
 m.update(yaml.dump(template_yaml))
 dib_name = 'dib_' + m.hexdigest() 
@@ -72,12 +70,10 @@ for res in template_yaml['resources']:
         print "Creating image for resource %s" % res
         cmd = "/usr/bin/virt-builder -o " + dib_name + "_" + res + " fedora-19 --install cloud-init,heat-cfntools --mkdir /var/lib/heat-cfntools --write /var/lib/heat-cfntools/cfn-init-data:'" + json.dumps(template_yaml['resources'][res]['Metadata']) + "' --run-command 'yum -y update' --run-command '/usr/bin/cfn-init' --run-command 'passwd -l root'"
 
-        c = CommandRunner(cmd)
-        c.run()
-#        print '%s' % c.stdout()
+        c = CommandRunner(cmd).run()
 
         del template_yaml['resources'][res]['Metadata']
-        template_yaml['resources'][res]['properties']['image'] = "'" + dib_name + res + "'"
+        template_yaml['resources'][res]['properties']['image'] = "'" + dib_name + "_" + res + "'"
 
 # output new template
 print 'Writing new template in %s.' % outfile_name
